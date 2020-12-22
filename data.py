@@ -4,7 +4,8 @@ import random
 from typing import Dict, List, Union, Tuple
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
 from transformers import PreTrainedTokenizerFast
 
 DATA_ROOT = Path('data')
@@ -154,7 +155,46 @@ class SPOExtractionDataset(Dataset):
         else:
             predicate, s_span, o_span = self.predicates[idx], self.s_spans[idx], self.o_spans[idx]
 
-        so_pos = torch.zeros((4, len(text_encoded)))
+        so_pos = torch.zeros((len(text_encoded), 4))
         for i, pos in enumerate(s_span + o_span):
-            so_pos[i, pos] = 1
+            so_pos[pos, i] = 1
         return text_encoded, predicate, so_pos
+
+    @staticmethod
+    def padding_collate(batch: List[Tuple[torch.LongTensor, int, torch.Tensor]]) \
+            -> Tuple[torch.LongTensor, torch.LongTensor, torch.Tensor, torch.LongTensor]:
+        """
+        Collate function generates tensors with a batch of data.
+
+        Args:
+            batch: Batch of data.
+
+        Returns:
+            batch_size, pad_len
+            batch_size,
+            batch_size, pad_len, 4
+            batch_size, pad_len
+        """
+        input_ids, predicates, so_locs = zip(*batch)
+        attention_mask = list(map(torch.ones_like, input_ids))
+        return pad_sequence(input_ids, batch_first=True, padding_value=0), torch.LongTensor(predicates), \
+            pad_sequence(so_locs, batch_first=True, padding_value=0.), \
+            pad_sequence(attention_mask, batch_first=True, padding_value=0)
+
+    def get_dataloader(self, batch_size: int, shuffle: bool = True, pin_memory: bool = True, **kwargs) -> DataLoader:
+        """
+        Creates dataloader for dataset instance.
+
+        Args:
+            batch_size: Batch size.
+            shuffle: Whether shuffle data at every epoch. Default: True
+            pin_memory: Whether use pinned memory for faster data
+                transfer to GPUs. Default: True
+            **kwargs: Other kwargs (except for collate_fn) supported by
+                DataLoader.
+
+        Returns:
+            DataLoader.
+        """
+        return DataLoader(self, batch_size=batch_size, collate_fn=self.padding_collate,
+                          shuffle=shuffle, pin_memory=pin_memory, **kwargs)
