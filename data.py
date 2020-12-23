@@ -1,6 +1,6 @@
 from pathlib import Path
 import json
-import random
+import re
 from typing import Dict, List, Union, Tuple
 
 import torch
@@ -44,9 +44,9 @@ class PredicateSchema:
 class SPOExtractionDataset(Dataset):
 
     predicate_schema = PredicateSchema.from_file()
+    sub_patterns = [(re.compile(r'\s?(\d+)\s?'), r'\g<1>')]
 
-    def __init__(self, data: List[Dict[str, Union[str, List[List[str]]]]], tokenizer: BertTokenizerFast,
-                 train: bool = True):
+    def __init__(self, data: List[Dict[str, Union[str, List[List[str]]]]], tokenizer: BertTokenizerFast):
         """
         Dataset for subject, predicate, object triplet extraction.
         Calling from_file constructor is recommended.
@@ -54,49 +54,40 @@ class SPOExtractionDataset(Dataset):
         Args:
             data: List of data entries.
             tokenizer: BERT tokenizer.
-            train: Training mode. If set to True, a 'left join' on
-                sentence is performed with one sampled triplet joined
-                on each sentence. Otherwise, a 'right join' on triplet
-                is performed with sentences joined on all triplets.
-                Default: True
         """
         self.tokenizer = tokenizer
-        self.train = train
-        input_ids = tokenizer([self.clean_str(d['text']) for d in data])['input_ids']
+        self.input_ids = tokenizer([self.clean_str(d['text']) for d in data])['input_ids']
         self.predicates, self.subject_spans, self.object_spans = [], [], []
-        self.input_ids = input_ids if self.train else []
-        for text_encoded, entry in zip(input_ids, data):
+        for input_ids, entry in zip(self.input_ids, data):
             try:
-                predicates, subject_spans, object_spans = self.process_entry(text_encoded, entry['spo_list'])
+                predicates, subject_spans, object_spans = self.process_entry(input_ids, entry['spo_list'])
             except ValueError:
                 continue
-            if self.train:
-                self.predicates.append(predicates)
-                self.subject_spans.append(subject_spans)
-                self.object_spans.append(object_spans)
-            else:
-                self.input_ids.extend([text_encoded] * len(predicates))
-                self.predicates.extend(predicates)
-                self.subject_spans.extend(subject_spans)
-                self.object_spans.extend(object_spans)
+            self.predicates.append(predicates)
+            self.subject_spans.append(subject_spans)
+            self.object_spans.append(object_spans)
 
     @classmethod
-    def from_file(cls, filename: str, **kwargs):
+    def from_file(cls, filename: str, tokenizer: BertTokenizerFast):
         """
         Constructor reads dataset from file
 
         Args:
             filename: Filename in DATA_ROOT.
-            **kwargs: kwargs supported in __init__.
+            tokenizer: BERT tokenizer.
         """
         with open(DATA_ROOT / filename) as f:
             data = json.load(f)
-        return cls(data, **kwargs)
+        return cls(data, tokenizer)
 
     @staticmethod
     def clean_str(s: str) -> str:
         """
-        Preprocesses string.
+        Implements strategies to clean strings.
+
+        Current rules:
+            1. Lower letters.
+            2. Trim white spaces around numbers.
 
         Args:
             s: Input string.
@@ -104,15 +95,18 @@ class SPOExtractionDataset(Dataset):
         Returns:
             Cleaned string.
         """
-        return s.lower().replace(' ', '')
+        clean_s = s.lower()
+        for pattern, sub in SPOExtractionDataset.sub_patterns:
+            clean_s = pattern.sub(sub, clean_s)
+        return clean_s
 
-    def process_entry(self, text_encoded: List[int], spo_list: List[List[str]]) \
+    def process_entry(self, input_ids: List[int], spo_list: List[List[str]]) \
             -> Tuple[List[int], List[Tuple[int, int]], List[Tuple[int, int]]]:
         """
         Processes each data entry.
 
         Args:
-            text_encoded: Pre-tokenized text.
+            input_ids: Pre-tokenized text.
             spo_list: List of subject, predicate and object triplets.
 
         Returns:
@@ -123,7 +117,7 @@ class SPOExtractionDataset(Dataset):
         tokenized_entities = self.tokenizer(entities)['input_ids']
 
         subject_spans, object_spans = [], []
-        unicoded_text = ''.join(map(chr, text_encoded))
+        unicoded_text = ''.join(map(chr, input_ids))
         for i in range(0, len(tokenized_entities), 2):
             subject_encoded = tokenized_entities[i][1:-1]
             object_encoded = tokenized_entities[i + 1][1:-1]
@@ -133,40 +127,39 @@ class SPOExtractionDataset(Dataset):
             if -1 in (subject_start, object_start):
                 raise ValueError('Substring not found.')
 
-            subject_spans.append((subject_start, subject_start + len(subject_encoded)))
-            object_spans.append((object_start, object_start + len(object_encoded)))
+            subject_spans.append((subject_start, subject_start + len(subject_encoded) - 1))
+            object_spans.append((object_start, object_start + len(object_encoded) - 1))
 
         return predicates, subject_spans, object_spans
 
     def __len__(self) -> int:
         return len(self.input_ids)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.LongTensor, int, int, int, int, int]:
+    def __getitem__(self, idx: int) -> Tuple[torch.LongTensor, torch.Tensor, torch.Tensor]:
         """
 
         Args:
             idx: Index.
 
         Returns:
-            Encoded text tensor, predicate and subject object position
-                tensor
+            input_ids: seq_len
+            predicate_hot: num_predicates
+            position_hot: seq_len, num_predicates, 4
         """
         input_ids = torch.LongTensor(self.input_ids[idx])
-        if self.train:
-            r = random.randrange(len(self.predicates[idx]))
-            predicate = self.predicates[idx][r]
-            subject_start, subject_end = self.subject_spans[idx][r]
-            object_start, object_end = self.object_spans[idx][r]
-        else:
-            predicate = self.predicates[idx]
-            subject_start, subject_end = self.subject_spans[idx]
-            object_start, object_end = self.object_spans[idx]
+        predicate_hot = torch.zeros(len(self.predicate_schema))
+        predicate_hot[self.predicates[idx]] = 1
 
-        return input_ids, predicate, subject_start, subject_end, object_start, object_end
+        position_hot = torch.zeros((len(input_ids), len(self.predicate_schema), 4))
+        for i in range(len(self.predicates[idx])):
+            for j, pos in enumerate(self.subject_spans[idx][i] + self.object_spans[idx][i]):
+                position_hot[pos, self.predicates[idx][i], j] = 1
+
+        return input_ids, predicate_hot, position_hot
 
     @staticmethod
-    def padding_collate(batch: List[Tuple[torch.LongTensor, int, int, int, int, int]]) \
-            -> Dict[str, Union[torch.LongTensor, Dict[str, torch.LongTensor]]]:
+    def padding_collate(batch: List[Tuple[torch.LongTensor, torch.Tensor, torch.Tensor]]) \
+            -> Dict[str, torch.Tensor]:
         """
         Collate function generates tensors with a batch of data.
 
@@ -176,21 +169,15 @@ class SPOExtractionDataset(Dataset):
         Returns:
             input_ids: batch_size, pad_len
             attention_mask: batch_size, pad_len
-            targets: batch_size
+            predicate_hot: batch_size, num_predicates
+            position_hot: batch_size, pad_len, num_predicates, 4
         """
-        input_ids, predicate, subject_start, subject_end, object_start, object_end = zip(*batch)
+        input_ids, predicate_hot, position_hot = zip(*batch)
         attention_mask = list(map(torch.ones_like, input_ids))
-        return {
-            'input_ids': pad_sequence(input_ids, batch_first=True, padding_value=0),
-            'attention_mask': pad_sequence(attention_mask, batch_first=True, padding_value=0),
-            'targets': {
-                'predicate': torch.LongTensor(predicate),
-                'subject_start': torch.LongTensor(subject_start),
-                'subject_end': torch.LongTensor(subject_end),
-                'object_start': torch.LongTensor(object_start),
-                'object_end': torch.LongTensor(object_end)
-            }
-        }
+        return {'input_ids': pad_sequence(input_ids, batch_first=True, padding_value=0),
+                'attention_mask': pad_sequence(attention_mask, batch_first=True, padding_value=0),
+                'predicate_hot': torch.Tensor(predicate_hot),
+                'position_hot': pad_sequence(position_hot, batch_first=True, padding_value=0.)}
 
     def get_dataloader(self, batch_size: int, shuffle: bool = True, pin_memory: bool = True, **kwargs) -> DataLoader:
         """
