@@ -25,37 +25,58 @@ class BertForJointSPOExtraction(nn.Module):
         self.bert = bert
         hidden_size = self.bert.config.hidden_size
         self.predicate_fc = nn.Linear(hidden_size, num_predicates)
-        self.position_fc = nn.Linear(hidden_size, 4)
-
-        self.loss_fn = nn.CrossEntropyLoss()
+        self.position_fc = nn.Linear(hidden_size, num_predicates * 4)
+        self.predicate_loss_fn = nn.BCEWithLogitsLoss()
+        self.position_loss_fn_base = nn.BCEWithLogitsLoss(reduction='none')
+        self.num_predicates = num_predicates
 
     def forward(self, input_ids: torch.LongTensor, attention_mask: torch.LongTensor,
-                targets: Optional[Dict[str, torch.LongTensor]] = None) -> Output:
+                targets: Optional[Dict[str, torch.Tensor]]) -> Output:
         """
 
         Args:
             input_ids: batch_size, pad_len
             attention_mask: batch_size, pad_len
-            targets: batch_size
+            targets (optional):
+                predicate: batch_size, num_predicates
+                position: batch_size, pad_len, num_predicates, 4
 
         Returns:
-            Output with loss and logits.
+            Output with loss (optional) and logits.
         """
         bert_out = self.bert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         # batch_size, pad_len, hidden_size
 
         predicate_logits = self.predicate_fc(bert_out[:, 0, :])  # batch_size, num_predicates
-        position_logits = self.position_fc(bert_out)  # batch_size, pad_len, 4
-        position_logits.masked_fill_(~attention_mask[:, :, None].bool(), float('-inf'))
-        logits = {'predicate': predicate_logits,
-                  'subject_start': position_logits[:, :, 0], 'subject_end': position_logits[:, :, 1],
-                  'object_start': position_logits[:, :, 2], 'object_end': position_logits[:, :, 3]}
+        position_logits = self.position_fc(bert_out).view(input_ids.shape[0], -1, self.num_predicates, 4)
+        # batch_size, pad_len, num_predicates, 4
+        position_logits.masked_fill_(~attention_mask[:, :, None, None].bool(), float('-inf'))
 
         loss = None
         if targets is not None:
-            loss = 0
-            for k in logits:
-                weight = 1 if k == 'predicate' else 0.5
-                loss += weight * self.loss_fn(logits[k], targets[k])
+            predicate_hot, position_hot = targets
+            predicate_loss = self.predicate_loss_fn(predicate_logits, predicate_hot)
+            position_loss = self.position_loss_fn(position_logits, position_hot, predicate_hot, attention_mask)
+            loss = predicate_loss + position_loss
 
-        return Output(loss, logits)
+        return Output(loss, {'predicate': predicate_logits, 'position': position_logits})
+
+    def position_loss_fn(self, position_logits: torch.Tensor, position_hot: torch.Tensor, predicate_hot: torch.Tensor,
+                         attention_mask: torch.LongTensor) -> torch.Tensor:
+        """
+        Position loss function.
+
+        Args:
+            position_logits: batch_size, pad_len, num_predicates, 4
+            position_hot: batch_size, pad_len, num_predicates, 4
+            predicate_hot: batch_size, num_predicates
+            attention_mask: batch_size, pad_len
+
+        Returns:
+            0-dim loss.
+        """
+        seq_mask = attention_mask[:, :, None, None]
+        loss = self.position_loss_fn_base(position_logits, position_hot)  # batch_size, pad_len, num_predicates, 4
+        masked_loss = loss * predicate_hot[:, None, :, None] * seq_mask
+        sentence_loss = (masked_loss / seq_mask.sum(dim=1, keepdim=True)).sum(1)  # batch_size, num_predicates, 4
+        return sentence_loss.mean()

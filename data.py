@@ -56,13 +56,14 @@ class SPOExtractionDataset(Dataset):
             tokenizer: BERT tokenizer.
         """
         self.tokenizer = tokenizer
-        self.input_ids = tokenizer([self.clean_str(d['text']) for d in data])['input_ids']
-        self.predicates, self.subject_spans, self.object_spans = [], [], []
-        for input_ids, entry in zip(self.input_ids, data):
+        tokenized = tokenizer([self.clean_str(d['text']) for d in data])['input_ids']
+        self.input_ids, self.predicates, self.subject_spans, self.object_spans = [], [], [], []
+        for input_ids, entry in zip(tokenized, data):
             try:
                 predicates, subject_spans, object_spans = self.process_entry(input_ids, entry['spo_list'])
             except ValueError:
                 continue
+            self.input_ids.append(input_ids)
             self.predicates.append(predicates)
             self.subject_spans.append(subject_spans)
             self.object_spans.append(object_spans)
@@ -159,7 +160,7 @@ class SPOExtractionDataset(Dataset):
 
     @staticmethod
     def padding_collate(batch: List[Tuple[torch.LongTensor, torch.Tensor, torch.Tensor]]) \
-            -> Dict[str, torch.Tensor]:
+            -> Dict[str, Union[torch.LongTensor, Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Collate function generates tensors with a batch of data.
 
@@ -169,15 +170,17 @@ class SPOExtractionDataset(Dataset):
         Returns:
             input_ids: batch_size, pad_len
             attention_mask: batch_size, pad_len
-            predicate_hot: batch_size, num_predicates
-            position_hot: batch_size, pad_len, num_predicates, 4
+            targets:
+                predicate_hot: batch_size, num_predicates
+                position_hot: batch_size, pad_len, num_predicates, 4
         """
         input_ids, predicate_hot, position_hot = zip(*batch)
         attention_mask = list(map(torch.ones_like, input_ids))
-        return {'input_ids': pad_sequence(input_ids, batch_first=True, padding_value=0),
-                'attention_mask': pad_sequence(attention_mask, batch_first=True, padding_value=0),
-                'predicate_hot': torch.Tensor(predicate_hot),
-                'position_hot': pad_sequence(position_hot, batch_first=True, padding_value=0.)}
+        return {
+            'input_ids': pad_sequence(input_ids, batch_first=True, padding_value=0),
+            'attention_mask': pad_sequence(attention_mask, batch_first=True, padding_value=0),
+            'targets': (torch.vstack(predicate_hot), pad_sequence(position_hot, batch_first=True, padding_value=0.))
+        }
 
     def get_dataloader(self, batch_size: int, shuffle: bool = True, pin_memory: bool = True, **kwargs) -> DataLoader:
         """
