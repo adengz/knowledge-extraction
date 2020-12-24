@@ -7,7 +7,7 @@ from transformers import BertModel
 
 from data import SPOExtractionDataset
 
-Output = namedtuple('Output', ['loss', 'logits'])
+Output = namedtuple('Output', ['loss', 'predocate_logits', 'position_logits'])
 
 
 class BertForJointSPOExtraction(nn.Module):
@@ -31,15 +31,14 @@ class BertForJointSPOExtraction(nn.Module):
         self.num_predicates = num_predicates
 
     def forward(self, input_ids: torch.LongTensor, attention_mask: torch.LongTensor,
-                targets: Optional[Dict[str, torch.Tensor]]) -> Output:
+                predicate_hot: Optional[torch.Tensor] = None, position_hot: Optional[torch.Tensor] = None) -> Output:
         """
 
         Args:
             input_ids: batch_size, pad_len
             attention_mask: batch_size, pad_len
-            targets (optional):
-                predicate: batch_size, num_predicates
-                position: batch_size, pad_len, num_predicates, 4
+            predicate_hot: batch_size, num_predicates
+            position_hot: batch_size, pad_len, num_predicates, 4
 
         Returns:
             Output with loss (optional) and logits.
@@ -53,13 +52,12 @@ class BertForJointSPOExtraction(nn.Module):
         position_logits.masked_fill_(~attention_mask[:, :, None, None].bool(), float('-inf'))
 
         loss = None
-        if targets is not None:
-            predicate_hot, position_hot = targets
+        if predicate_hot is not None and position_hot is not None:
             predicate_loss = self.predicate_loss_fn(predicate_logits, predicate_hot)
             position_loss = self.position_loss_fn(position_logits, position_hot, predicate_hot, attention_mask)
             loss = predicate_loss + position_loss
 
-        return Output(loss, {'predicate': predicate_logits, 'position': position_logits})
+        return Output(loss, predicate_logits, position_logits)
 
     def position_loss_fn(self, position_logits: torch.Tensor, position_hot: torch.Tensor, predicate_hot: torch.Tensor,
                          attention_mask: torch.LongTensor) -> torch.Tensor:
