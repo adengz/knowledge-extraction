@@ -27,7 +27,7 @@ class BertForJointSPOExtraction(nn.Module):
         self.predicate_fc = nn.Linear(hidden_size, num_predicates)
         self.position_fc = nn.Linear(hidden_size, num_predicates * 4)
         self.predicate_loss_fn = nn.BCEWithLogitsLoss()
-        self.position_loss_fn_base = nn.BCEWithLogitsLoss(reduction='none')
+        self.position_loss_fn_base = nn.BCELoss(reduction='none')
         self.num_predicates = num_predicates
 
     def forward(self, input_ids: torch.LongTensor, attention_mask: torch.LongTensor,
@@ -74,7 +74,8 @@ class BertForJointSPOExtraction(nn.Module):
             0-dim loss.
         """
         seq_mask = attention_mask[:, :, None, None]
-        loss = self.position_loss_fn_base(position_logits, position_hot)  # batch_size, pad_len, num_predicates, 4
+        loss = self.position_loss_fn_base(torch.sigmoid(position_logits), position_hot)
+        # batch_size, pad_len, num_predicates, 4
         masked_loss = loss * predicate_hot[:, None, :, None] * seq_mask
         sentence_loss = (masked_loss / seq_mask.sum(dim=1, keepdim=True)).sum(1)  # batch_size, num_predicates, 4
         return sentence_loss.mean()
