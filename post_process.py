@@ -2,6 +2,7 @@ import torch
 from sklearn.metrics import f1_score
 
 
+@torch.no_grad()
 def get_metrics(predicate_logits: torch.Tensor, position_logits: torch.Tensor,
                 predicate_hot: torch.Tensor, position_hot: torch.Tensor):
     """
